@@ -1,0 +1,11 @@
+aws_account_id = "123456789012"
+project_name   = "hello-world"
+instance_type  = "t3.small"
+k3s_version    = "v1.36.5+k3s1"
+github_oidc_subject = "repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/main"
+
+# Optional: pin a current Canonical Ubuntu 24.04 amd64 AMI in Frankfurt.
+# ami_id = "ami-0123456789abcdef0"
+
+# Optional: restrict HTTP to your public IP instead of everyone.
+# http_cidr = "203.0.113.10/32"

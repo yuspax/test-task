@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+exec > >(tee -a /var/log/hello-world-bootstrap.log) 2>&1
+trap 'echo "Bootstrap failed at line $LINENO" >&2' ERR
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get -o Acquire::Retries=5 -o DPkg::Lock::Timeout=300 update
+apt-get -o Acquire::Retries=5 -o DPkg::Lock::Timeout=300 install -y ca-certificates curl unzip
+
+awscli_dir=$(mktemp -d /tmp/awscli.XXXXXX)
+curl --fail --silent --show-error --location --retry 5 \
+  --connect-timeout 10 --max-time 300 \
+  https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.34.41.zip \
+  --output "$awscli_dir/installer.zip"
+unzip -q "$awscli_dir/installer.zip" -d "$awscli_dir"
+"$awscli_dir/aws/install" --update
+rm -rf "$awscli_dir"
+
+# Canonical's standard Ubuntu AWS AMI normally includes the snap SSM agent.
+if ! snap list amazon-ssm-agent >/dev/null 2>&1; then
+  snap install amazon-ssm-agent --classic
+fi
+snap start --enable amazon-ssm-agent
+
+modprobe overlay
+modprobe br_netfilter
+cat > /etc/modules-load.d/k3s.conf <<'MODULES'
+overlay
+br_netfilter
+MODULES
+cat > /etc/sysctl.d/90-k3s.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+SYSCTL
+sysctl --system
+
+install -d -m 0700 /etc/rancher/k3s
+cat > /etc/rancher/k3s/config.yaml <<'CONFIG'
+node-name: ${node_name}
+write-kubeconfig-mode: "0600"
+secrets-encryption: true
+kubelet-arg:
+  - "container-log-max-size=10Mi"
+  - "container-log-max-files=3"
+CONFIG
+
+# Use the installer from the pinned release; it verifies the K3s binary checksum.
+curl --fail --silent --show-error --location --retry 5 \
+  --connect-timeout 10 --max-time 120 \
+  'https://raw.githubusercontent.com/k3s-io/k3s/${k3s_version}/install.sh' \
+  --output /tmp/install-k3s.sh
+INSTALL_K3S_VERSION='${k3s_version}' INSTALL_K3S_EXEC=server sh /tmp/install-k3s.sh
+rm /tmp/install-k3s.sh
+
+# Wait for the local API before waiting for node readiness.
+for attempt in $(seq 1 60); do
+  if /usr/local/bin/k3s kubectl get node '${node_name}' >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+/usr/local/bin/k3s kubectl wait --for=condition=Ready 'node/${node_name}' --timeout=300s
+/usr/local/bin/k3s secrets-encrypt status
+
+# ECR passwords expire after 12h. Refresh the encrypted Kubernetes Secret every 4h.
+/usr/local/bin/k3s kubectl get namespace hello-world >/dev/null 2>&1 || /usr/local/bin/k3s kubectl create namespace hello-world
+cat > /usr/local/bin/refresh-ecr-secret <<'REFRESH'
+#!/usr/bin/env bash
+set -euo pipefail
+aws ecr get-authorization-token --region eu-central-1 --output json |
+  python3 -c '
+import base64, json, sys
+entry = json.load(sys.stdin)["authorizationData"][0]
+registry = entry["proxyEndpoint"].removeprefix("https://")
+config = json.dumps({"auths": {registry: {"auth": entry["authorizationToken"]}}})
+print(json.dumps({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "ecr-registry", "namespace": "hello-world"}, "type": "kubernetes.io/dockerconfigjson", "data": {".dockerconfigjson": base64.b64encode(config.encode()).decode()}}))
+' | /usr/local/bin/k3s kubectl apply --server-side --field-manager=ecr-refresh -f -
+REFRESH
+chmod 0700 /usr/local/bin/refresh-ecr-secret
+cat > /etc/systemd/system/ecr-refresh.service <<'SERVICE'
+[Unit]
+Description=Refresh ECR image pull credentials
+After=network-online.target k3s.service
+Wants=network-online.target
+Requires=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/refresh-ecr-secret
+Restart=on-failure
+RestartSec=60
+SERVICE
+cat > /etc/systemd/system/ecr-refresh.timer <<'TIMER'
+[Unit]
+Description=Refresh ECR credentials every four hours
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* 00/4:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+systemctl daemon-reload
+systemctl enable --now ecr-refresh.timer
+systemctl start ecr-refresh.service
+
+touch /var/lib/hello-world-bootstrap.done
+echo 'K3s bootstrap finished successfully.'
